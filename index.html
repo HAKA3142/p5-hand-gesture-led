@@ -42,6 +42,7 @@
     th {color:#36516f;background:#f3f6fa;}
     pre {background:#1e2d43;color:#eef3fc;border-radius:9px;padding:19px 22px;overflow:auto;font-size:13px;line-height:1.7;}
     pre code {font-family:Consolas,"Courier New",monospace;}
+    pre.full-code {max-height:560px;overflow:auto;white-space:pre;tab-size:2;}
     :not(pre)>code {background:#f0f3f8;padding:2px 5px;border-radius:3px;font-size:.95em;}
     a {color:#356cac;text-underline-offset:3px;}
     .links {display:flex;flex-wrap:wrap;gap:14px;margin:13px 0 0;font-size:14px;}
@@ -78,11 +79,10 @@
         <div class="placeholder ratio16" id="demo-placeholder">
           <svg class="symbol" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/></svg>
           <strong>작동 영상</strong>
-          <small>demo.mp4 파일을 올리면 이곳에 영상이 표시됩니다.</small>
+          <small>demo.mp4</small>
         </div>
         <video id="demo-video" controls playsinline preload="metadata" style="display:none"><source src="demo.mp4" type="video/mp4">이 브라우저는 동영상 재생을 지원하지 않습니다.</video>
       </div>
-      <p class="small">영상은 실제 작동을 촬영한 후 추가할 예정입니다.</p>
     </section>
 
     <section id="photos">
@@ -117,46 +117,308 @@
 
     <section id="code">
       <h2><span class="num">04.</span>소스코드</h2>
-      <p>p5.js에서는 손가락 끝 좌표를 이용해 거리를 계산하고, Arduino는 전달받은 밝기 값을 PWM 출력에 적용한다.</p>
-      <h3>p5.js 주요 코드</h3>
-      <pre><code>// 엄지 끝(4번), 집게손가락 끝(8번)
-let thumb = hand.keypoints[4];
-let index = hand.keypoints[8];
+      <p>p5.js에서는 HandPose로 엄지와 집게손가락 끝을 인식하고, 두 손가락의 거리를 LED 밝기 값으로 변환했다. Arduino UNO에서는 시리얼 통신으로 받은 값을 3번 핀의 PWM 출력에 적용했다.</p>
+      <h3>p5.js 코드 (sketch.js)</h3>
+      <pre class="full-code"><code>let handPose, video, slider;
+let hands = [];
+let connections = [];
 
-// 두 손가락 끝 사이 거리
-let d = dist(thumb.x, thumb.y, index.x, index.y);
+let port = null;
+let writer = null;
+let connectButton;
 
-// 거리 → 슬라이더(0~100) → LED 밝기(0~255)
-let value = map(d, 20, 180, 0, 100, true);
-let brightness = round(map(value, 0, 100, 0, 255));</code></pre>
-      <h3>Arduino IDE 주요 코드</h3>
-      <pre><code>int led = 3;
+let fingerDistance = 0;
+let smoothValue = 0;
+let manualUntil = 0;
+
+let sending = false;
+let connecting = false;
+let lastSent = -1;
+let lastSendTime = 0;
+
+let statusText = &quot;Arduino 연결 안 됨&quot;;
+let modelStatus = &quot;손 인식 모델 로딩 중&quot;;
+
+// 카메라 해상도
+const CAM_W = 480;
+const CAM_H = 360;
+
+// 화면에 표시할 크기
+const VIEW_W = 640;
+const VIEW_H = 480;
+
+// 1. 처음 한 번 실행
+async function setup() {
+  createCanvas(640, 540);
+  frameRate(30);
+
+  // 세로 슬라이더
+  slider = createSlider(0, 100, 0, 1);
+  slider.style(&quot;writing-mode&quot;, &quot;vertical-lr&quot;);
+  slider.style(&quot;direction&quot;, &quot;rtl&quot;);
+  slider.style(&quot;height&quot;, &quot;350px&quot;);
+  slider.style(&quot;width&quot;, &quot;22px&quot;);
+  slider.position(15, 65);
+  slider.input(updateSliderValue);
+
+  // Arduino 연결 버튼
+  connectButton = createButton(&quot;Arduino 연결 / 해제&quot;);
+  connectButton.position(15, 550);
+  connectButton.mousePressed(toggleArduino);
+
+  // 카메라 실행
+  video = createCapture(VIDEO);
+  video.size(CAM_W, CAM_H);
+  video.hide();
+
+  // ml5.js 확인
+  if (typeof ml5 === &quot;undefined&quot;) {
+    modelStatus = &quot;ml5 라이브러리 로딩 실패&quot;;
+    return;
+  }
+
+  try {
+    handPose = await ml5.handPose({
+      maxHands: 1,
+      modelType: &quot;lite&quot;
+    });
+
+    connections = handPose.getConnections();
+    handPose.detectStart(video, gotHands);
+    modelStatus = &quot;손 인식 준비 완료&quot;;
+  } catch (error) {
+    modelStatus = &quot;HandPose 모델 오류&quot;;
+    console.error(error);
+  }
+}
+
+// 2. 계속 반복 실행
+function draw() {
+  background(240);
+
+  // 거울처럼 카메라 화면 표시
+  if (video &amp;&amp; video.elt.readyState &gt;= 2) {
+    push();
+    translate(VIEW_W, 0);
+    scale(-1, 1);
+    image(video, 0, 0, VIEW_W, VIEW_H);
+    pop();
+  } else {
+    fill(0);
+    textSize(20);
+    text(&quot;카메라 준비 중...&quot;, 200, 230);
+  }
+
+  // 손 관절 표시
+  drawSkeletons();
+  drawKeyPoints();
+
+  if (hands.length &gt; 0) {
+    let hand = hands[0];
+    let thumb = hand.keypoints[4];
+    let index = hand.keypoints[8];
+
+    if (thumb &amp;&amp; index) {
+      // 실제 카메라 좌표에서 손가락 거리 계산
+      fingerDistance = dist(
+        thumb.x, thumb.y,
+        index.x, index.y
+      );
+
+      // 화면 좌표로 변환
+      let tx = screenX(thumb.x);
+      let ty = screenY(thumb.y);
+      let ix = screenX(index.x);
+      let iy = screenY(index.y);
+
+      // 엄지와 검지 사이 노란색 선
+      stroke(255, 230, 0);
+      strokeWeight(4);
+      line(tx, ty, ix, iy);
+
+      // 손가락 거리 → 0~100%
+      let target = map(
+        fingerDistance,
+        15, 130,
+        0, 100,
+        true
+      );
+
+      // 슬라이더 반응 속도 개선
+      if (millis() &gt; manualUntil) {
+        smoothValue = lerp(
+          smoothValue,
+          target,
+          0.7
+        );
+        slider.value(round(smoothValue));
+      }
+    }
+  } else if (millis() &gt; manualUntil) {
+    // 손이 사라지면 LED 끄기
+    smoothValue = lerp(smoothValue, 0, 0.7);
+    slider.value(round(smoothValue));
+  }
+
+  // 슬라이더 값
+  let percent = Number(slider.value());
+  let brightness = round(
+    map(percent, 0, 100, 0, 255)
+  );
+
+  // 화면 하단
+  noStroke();
+  fill(235, 242, 250);
+  rect(0, 480, 640, 60);
+  fill(25, 40, 60);
+  textAlign(LEFT);
+  textSize(17);
+  text(&quot;LED Brightness: &quot; + percent + &quot;%&quot;, 15, 505);
+  text(&quot;PWM: &quot; + brightness + &quot; / 255&quot;, 250, 505);
+
+  textSize(12);
+  text(modelStatus, 15, 527);
+  text(statusText, 320, 527);
+
+  // Arduino로 밝기 전송
+  if (
+    writer &amp;&amp;
+    !sending &amp;&amp;
+    brightness !== lastSent &amp;&amp;
+    millis() - lastSendTime &gt;= 70
+  ) {
+    lastSendTime = millis();
+    sendBrightness(brightness);
+  }
+}
+
+// 3. 카메라 좌표 → 화면 좌표
+function screenX(x) {
+  return VIEW_W - x * VIEW_W / CAM_W;
+}
+function screenY(y) {
+  return y * VIEW_H / CAM_H;
+}
+
+// 4. 손 인식 결과 저장
+function gotHands(results) {
+  hands = results;
+}
+
+// 5. 손 관절 연결선 표시
+function drawSkeletons() {
+  for (let hand of hands) {
+    for (let connection of connections) {
+      let a = hand.keypoints[connection[0]];
+      let b = hand.keypoints[connection[1]];
+      if (!a || !b) continue;
+
+      stroke(30, 230, 100);
+      strokeWeight(2);
+      line(
+        screenX(a.x), screenY(a.y),
+        screenX(b.x), screenY(b.y)
+      );
+    }
+  }
+}
+
+// 6. 손 관절 빨간 점 표시
+function drawKeyPoints() {
+  for (let hand of hands) {
+    for (let point of hand.keypoints) {
+      noStroke();
+      fill(255, 30, 30);
+      circle(screenX(point.x), screenY(point.y), 9);
+    }
+  }
+}
+
+// 7. 수동 슬라이더 조절
+function updateSliderValue() {
+  smoothValue = Number(slider.value());
+  manualUntil = millis() + 1500;
+}
+
+// 8. Arduino 연결 / 해제
+async function toggleArduino() {
+  if (connecting || sending) return;
+  if (!(&quot;serial&quot; in navigator)) {
+    statusText = &quot;Web Serial 미지원&quot;;
+    alert(&quot;Chrome 또는 Edge를 사용하세요.&quot;);
+    return;
+  }
+
+  connecting = true;
+  try {
+    if (port) {
+      // 연결 해제
+      if (writer) {
+        writer.releaseLock();
+        writer = null;
+      }
+      await port.close();
+      port = null;
+      statusText = &quot;Arduino 연결 해제&quot;;
+      lastSent = -1;
+    } else {
+      // Arduino 연결
+      port = await navigator.serial.requestPort();
+      await port.open({ baudRate: 9600 });
+      statusText = &quot;Arduino 준비 중&quot;;
+
+      // UNO 리셋 대기
+      await new Promise(resolve =&gt; setTimeout(resolve, 1800));
+      writer = port.writable.getWriter();
+      lastSent = -1;
+      statusText = &quot;Arduino 연결 성공&quot;;
+    }
+  } catch (error) {
+    statusText = &quot;연결 오류: &quot; + error.message;
+    console.error(error);
+
+    if (writer) {
+      try { writer.releaseLock(); } catch (e) {}
+      writer = null;
+    }
+    if (port) {
+      try { await port.close(); } catch (e) {}
+      port = null;
+    }
+  } finally {
+    connecting = false;
+  }
+}
+
+// 9. LED 밝기 전송
+async function sendBrightness(value) {
+  if (!writer || sending) return;
+  sending = true;
+  try {
+    await writer.write(new Uint8Array([value]));
+    lastSent = value;
+  } catch (error) {
+    statusText = &quot;전송 오류: &quot; + error.message;
+    console.error(error);
+  } finally {
+    sending = false;
+  }
+}</code></pre>
+      <h3>Arduino IDE 코드</h3>
+      <pre class="full-code"><code>const int LED_PIN = 3;
 
 void setup() {
-  pinMode(led, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
   Serial.begin(9600);
+  analogWrite(LED_PIN, 0);
 }
 
 void loop() {
   if (Serial.available() &gt; 0) {
-    int brightness = Serial.read();
-    analogWrite(led, brightness);
+    int brightness = Serial.read(); // p5.js에서 받은 0~255 바이트
+    analogWrite(LED_PIN, brightness);
   }
 }</code></pre>
-      <div class="links"><a href="sketch.js" target="_blank" rel="noopener">p5.js 전체 코드 보기</a><a href="arduino_led.ino" target="_blank" rel="noopener">Arduino 전체 코드 보기</a></div>
-      <h3>코드 캡처</h3>
-      <div class="two">
-        <figure class="asset">
-          <div class="placeholder" id="code1-placeholder"><strong>p5.js 코드 화면</strong><small>code1.jpg</small></div>
-          <img src="code1.jpg" id="code1-photo" alt="p5.js 코드 캡처" style="display:none">
-          <figcaption>그림 4. p5.js 코드</figcaption>
-        </figure>
-        <figure class="asset">
-          <div class="placeholder" id="code2-placeholder"><strong>Arduino IDE 코드 화면</strong><small>code2.jpg</small></div>
-          <img src="code2.jpg" id="code2-photo" alt="Arduino 코드 캡처" style="display:none">
-          <figcaption>그림 5. Arduino IDE 코드</figcaption>
-        </figure>
-      </div>
     </section>
 
     <section id="process">
@@ -173,15 +435,14 @@ void loop() {
 
     <section id="review">
       <h2><span class="num">06.</span>결과 및 느낀 점</h2>
-      <p>이번에는 기존 슬라이더 제어에 손 인식 기능을 연결하는 과정을 진행하고 있다. 웹캠에서 손가락의 위치를 정확히 읽는 것이 중요한 부분이었고, 라이브러리를 불러오는 과정에서도 오류가 발생할 수 있다는 것을 확인했다.</p>
-      <div class="status"><strong>최종 결과:</strong> 손 인식 및 LED 연동을 확인한 뒤 실제 작동 결과를 추가할 예정이다.</div>
-      <p class="small">* 위 결과 문단은 실제 시연이 끝난 뒤 본인이 확인한 내용으로 수정할 수 있다.</p>
+      <p>웹캠으로 엄지와 집게손가락 사이의 거리를 인식하고, 손가락 간격에 따라 슬라이더와 실제 LED 밝기가 변하는 동작을 확인했다. 처음에는 ml5.js 라이브러리를 불러오는 과정에서 오류가 있었고, 손 관절 표시가 늦게 따라오는 문제도 있었지만 코드를 수정하여 시연을 완료했다.</p>
+      <p>기존 과제에서는 마우스로 슬라이더를 직접 조절했지만, 이번에는 손동작으로 LED 밝기를 제어할 수 있었다.</p>
     </section>
     <footer>p5.js · HandPose · Arduino UNO R3 / LED 밝기 조절 과제</footer>
   </main>
   <script>
     // 사진을 업로드한 경우에만 안내 상자 대신 실제 사진을 보여준다.
-    ['sketch','wiring','handpose','code1','code2'].forEach(function(name){
+    ['sketch','wiring','handpose'].forEach(function(name){
       const picture=document.getElementById(name+'-photo');
       const placeholder=document.getElementById(name+'-placeholder');
       picture.addEventListener('load',function(){picture.style.display='block';placeholder.style.display='none';});
